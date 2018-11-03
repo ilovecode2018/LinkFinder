@@ -8,7 +8,7 @@ import os
 os.environ["BROWSER"] = "open"
 
 # Import libraries
-import re, sys, glob, cgi, argparse, jsbeautifier, webbrowser, subprocess, base64, ssl, xml.etree.ElementTree
+import re, sys, glob, cgi, argparse, jsbeautifier, webbrowser, subprocess, base64, ssl, xml.etree.ElementTree, urllib
 
 from gzip import GzipFile
 from string import Template
@@ -25,12 +25,45 @@ try:
 except ImportError:
     from urllib2 import Request, urlopen
 
+# Parse command line
+parser = argparse.ArgumentParser()
+parser.add_argument("-d", "--domain",
+                    help="Input a domain to recursively parse all javascript located in a page",
+                    action="store_true")
+parser.add_argument("-i", "--input",
+                    help="Input a: URL, file or folder. \
+                    For folders a wildcard can be used (e.g. '/*.js').",
+                    required="True", action="store")
+parser.add_argument("-o", "--output",
+                    help="Where to save the file, \
+                    including file name. Default: output.html",
+                    action="store", default="output.html")
+parser.add_argument("-r", "--regex",
+                    help="RegEx for filtering purposes \
+                    against found endpoint (e.g. ^/api/)",
+                    action="store")
+parser.add_argument("-b", "--burp",
+                    help="",
+                    action="store_true")
+parser.add_argument("-c", "--cookies",
+                    help="Add cookies for authenticated JS files",
+                    action="store", default="")
+args = parser.parse_args()
+
+if args.input[-1:] == "/":
+    args.input = args.input[:-1]
+
+if args.output != 'cli':
+    addition = ("[^\n]*","[^\n]*")
+else:
+    addition = ("","")
+
 # Regex used
-regex_str = r"""
+regex = re.compile(r"""
 
-  (?:"|')                               # Start newline delimiter
+  (%s(?:"|')                            # Start newline delimiter
 
-  (?P<link>
+  (?:
     ((?:[a-zA-Z]{1,10}://|//)           # Match a scheme [a-Z]*1-10 or //
     [^"'/]{1,}\.                        # Match a domainname (any character + dot)
     [a-zA-Z]{2,}[^"']{0,})              # The domainextension and/or path
@@ -38,7 +71,7 @@ regex_str = r"""
     |
 
     ((?:/|\.\./|\./)                    # Start with /,../,./
-    [^"'><,;| *()(%%$^/\\\[\]]          # Next character can't be...
+    [^"'><,;| *()(%%$^/\\\[\]]          # Next character can't be... 
     [^"'><,;|()]{1,})                   # Rest of the characters can't be
 
     |
@@ -52,14 +85,12 @@ regex_str = r"""
     ([a-zA-Z0-9_\-]{1,}                 # filename
     \.(?:php|asp|aspx|jsp|json)         # . + extension
     (?:\?[^"|']{0,}|))                  # ? mark with parameters
+ 
+  )             
+  
+  (?:"|')%s)                            # End newline delimiter
 
-  )
-
-  (?:"|')                               # End newline delimiter
-
-"""
-
-context_delimiter_str = "[^\n]*"
+""" % addition, re.VERBOSE)
 
 def parser_error(errmsg):
     '''
@@ -88,7 +119,7 @@ def parser_input(input):
     if args.burp:
         jsfiles = []
         items = xml.etree.ElementTree.fromstring(open(args.input, "r").read())
-
+        
         for item in items:
             jsfiles.append({"js":base64.b64decode(item.find('response').text).decode('utf-8',"replace"), "url":item.find('url').text})
         return jsfiles
@@ -113,7 +144,6 @@ def send_request(url):
     '''
     q = Request(url)
     # Support websites that force TLSv1.2
-    sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
 
     q.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
         AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36')
@@ -123,7 +153,12 @@ def send_request(url):
     q.add_header('Accept-Encoding', 'gzip')
     q.add_header('Cookie', args.cookies)
 
-    response = urlopen(q, context=sslcontext)
+    try:
+        sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+        response = urlopen(q, context=sslcontext)
+    except:
+        sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
+        response = urlopen(q, context=sslcontext)
 
     if response.info().get('Content-Encoding') == 'gzip':
         data = GzipFile(fileobj=readBytesCustom(response.read())).read()
@@ -134,43 +169,33 @@ def send_request(url):
 
     return data.decode('utf-8', 'replace')
 
-def parser_file(content, regex_str, mode=1, more_regex=None):
+def parser_file(content):
     '''
     Parse Input
-    content:    string of content to be searched
-    regex_str:  string of regex (must wrap regex group with ?P<link>)
-    mode:       mode of parsing. Set 1 to include surrounding contexts in the result
-    more_regex: string of regex to filter the result
-
-    Return the list of ["link": link, "context": context]
-    The context is optional if mode=1 is provided.
     '''
-    global context_delimiter_str
-
-    if mode == 1:
-        # Beautify
+    
+    # Beautify
+    if args.output != 'cli':
         if len(content) > 1000000:
             content = content.replace(";",";\r\n").replace(",",",\r\n")
         else:
             content = jsbeautifier.beautify(content)
-        # Wrap regex group with newline. This will return "link" and "context"
-        regex = re.compile("(?P<context>" + context_delimiter_str + regex_str + context_delimiter_str + ")", re.VERBOSE)
-    else:
-        regex = re.compile(regex_str, re.VERBOSE)
-
-    items = re.finditer(regex, content)
-    # Remove duplicate
-    items = {item['link']:item for item in items}.values()
-
+    
+    items = re.findall(regex, content)
+    items = list(set(items))
+        
     # Match Regex
     filtered_items = []
+
     for item in items:
         # Remove other capture groups from regex results
-        if more_regex:
-            if re.search(more_regex, item["link"]):
-                filtered_items.append(item)
+        group = list(filter(None, item))
+
+        if args.regex:
+            if re.search(args.regex, group[1]):
+                filtered_items.append(group)
         else:
-            filtered_items.append(item)
+            filtered_items.append(group)
 
     return filtered_items
 
@@ -179,8 +204,8 @@ def cli_output(endpoints):
     Output to CLI
     '''
     for endpoint in endpoints:
-        print(cgi.escape(endpoint["link"]).encode(
-            'ascii', 'ignore').decode('utf8'))
+        print(cgi.escape(endpoint[1]).encode(
+            'ascii', 'ignore').decode('utf8')) 
 
 def html_save(html):
     '''
@@ -222,119 +247,83 @@ def check_url(url):
                 url = args.input + url
             else:
                 url = args.input + "/" + url
-        return url
+        return url            
     else:
         return False
+# Convert input to URLs or JS files
+urls = parser_input(args.input)  
 
-if __name__ == "__main__":
-    # Parse command line
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--domain",
-                        help="Input a domain to recursively parse all javascript located in a page",
-                        action="store_true")
-    parser.add_argument("-i", "--input",
-                        help="Input a: URL, file or folder. \
-                        For folders a wildcard can be used (e.g. '/*.js').",
-                        required="True", action="store")
-    parser.add_argument("-o", "--output",
-                        help="Where to save the file, \
-                        including file name. Default: output.html",
-                        action="store", default="output.html")
-    parser.add_argument("-r", "--regex",
-                        help="RegEx for filtering purposes \
-                        against found endpoint (e.g. ^/api/)",
-                        action="store")
-    parser.add_argument("-b", "--burp",
-                        help="",
-                        action="store_true")
-    parser.add_argument("-c", "--cookies",
-                        help="Add cookies for authenticated JS files",
-                        action="store", default="")
-    args = parser.parse_args()
+# Convert URLs to JS
+html = ''
+for url in urls:
+    if not args.burp:
+        try:
+            file = send_request(url)
+        except Exception as e:
+            parser_error("invalid input defined or SSL error: %s" % e)
+    else:
+        file = url['js']
+        url = url['url']
 
-    if args.input[-1:] == "/":
-        args.input = args.input[:-1]
-
-    mode = 1
-    if args.output == "cli":
-        mode = 0
-
-    # Convert input to URLs or JS files
-    urls = parser_input(args.input)
-
-    # Convert URLs to JS
-    html = ''
-    for url in urls:
-        if not args.burp:
+    endpoints = parser_file(file)
+    if args.domain:
+        for endpoint in endpoints:
+            endpoint = cgi.escape(endpoint[1]).encode('ascii', 'ignore').decode('utf8')
+            endpoint = check_url(endpoint)
+            if endpoint is False:
+                continue
+            print("Running against: " + endpoint)
+            print("")
             try:
-                file = send_request(url)
+                file = send_request(endpoint)
+                new_endpoints = parser_file(file)
+                if args.output == 'cli':
+                    cli_output(new_endpoints)
+                else:
+                    html += '''
+                    <h1>File: <a href="%s" target="_blank" rel="nofollow noopener noreferrer">%s</a></h1>
+                    ''' % (cgi.escape(endpoint), cgi.escape(endpoint))
+
+                    for endpoint2 in new_endpoints:
+                        url = cgi.escape(endpoint2[1])
+                        string = "<div>%s" % (
+                            cgi.escape(url)
+                        )
+                        string2 = "<div class='container'>%s</div></div>" % cgi.escape(
+                            endpoint2[0]
+                        )
+                        string2 = string2.replace(
+                            cgi.escape(endpoint2[1]),
+                            "<span style='background-color:yellow'>%s</span>" %
+                            cgi.escape(endpoint2[1])
+                        )
+                        html += string + string2
             except Exception as e:
-                parser_error("invalid input defined or SSL error: %s" % e)
-        else:
-            file = url['js']
-            url = url['url']
+                print("Invalid input defined or SSL error for: " + endpoint)
+                continue
+    
+    if args.output == 'cli':
+        cli_output(endpoints)
+    else:
+        html += '''
+            <h1>File: <a href="%s" target="_blank" rel="nofollow noopener noreferrer">%s</a></h1>
+            ''' % (cgi.escape(url), cgi.escape(url))
 
-        endpoints = parser_file(file, regex_str, mode, args.regex)
-        if args.domain:
-            for endpoint in endpoints:
-                endpoint = cgi.escape(endpoint["link"]).encode('ascii', 'ignore').decode('utf8')
-                endpoint = check_url(endpoint)
-                if endpoint is False:
-                    continue
-                print("Running against: " + endpoint)
-                print("")
-                try:
-                    file = send_request(endpoint)
-                    new_endpoints = parser_file(file, regex_str, mode, args.regex)
-                    if args.output == 'cli':
-                        cli_output(new_endpoints)
-                    else:
-                        html += '''
-                        <h1>File: <a href="%s" target="_blank" rel="nofollow noopener noreferrer">%s</a></h1>
-                        ''' % (cgi.escape(endpoint), cgi.escape(endpoint))
+        for endpoint in endpoints:
+            url = cgi.escape(endpoint[1])
+            string = "<div>%s" % (
+                cgi.escape(url)
+            )
+            string2 = "<div class='container'>%s</div></div>" % cgi.escape(
+                endpoint[0]
+            )
+            string2 = string2.replace(
+                cgi.escape(endpoint[1]),
+                "<span style='background-color:yellow'>%s</span>" %
+                cgi.escape(endpoint[1])
+            )
 
-                        for endpoint2 in new_endpoints:
-                            url = cgi.escape(endpoint2["link"])
-                            string = "<div><a href='%s' class='text'>%s" % (
-                                cgi.escape(url),
-                                cgi.escape(url)
-                            )
-                            string2 = "</a><div class='container'>%s</div></div>" % cgi.escape(
-                                endpoint2["context"]
-                            )
-                            string2 = string2.replace(
-                                cgi.escape(endpoint2["link"]),
-                                "<span style='background-color:yellow'>%s</span>" %
-                                cgi.escape(endpoint2["link"])
-                            )
-                            html += string + string2
-                except Exception as e:
-                    print("Invalid input defined or SSL error for: " + endpoint)
-                    continue
+            html += string + string2
 
-        if args.output == 'cli':
-            cli_output(endpoints)
-        else:
-            html += '''
-                <h1>File: <a href="%s" target="_blank" rel="nofollow noopener noreferrer">%s</a></h1>
-                ''' % (cgi.escape(url), cgi.escape(url))
-
-            for endpoint in endpoints:
-                url = cgi.escape(endpoint["link"])
-                string = "<div><a href='%s' class='text'>%s" % (
-                    cgi.escape(url),
-                    cgi.escape(url)
-                )
-                string2 = "</a><div class='container'>%s</div></div>" % cgi.escape(
-                    endpoint["context"]
-                )
-                string2 = string2.replace(
-                    cgi.escape(endpoint["link"]),
-                    "<span style='background-color:yellow'>%s</span>" %
-                    cgi.escape(endpoint["link"])
-                )
-
-                html += string + string2
-
-    if args.output != 'cli':
-        html_save(html)
+if args.output != 'cli':
+    html_save(html)
